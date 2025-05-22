@@ -1,195 +1,232 @@
 import streamlit as st
-import os
 import json
-import numpy as np
+import os
+import tempfile
+from datetime import datetime
 from supabase import create_client
-from openai import OpenAI
+import numpy as np
+# from openai import OpenAI  # 이 줄 제거
+from sentence_transformers import SentenceTransformer  # 추가
+import dotenv
+import re
 
-# 페이지 구성
-st.set_page_config(page_title="안성탕면 시맨틱 검색", layout="wide")
-
-# Streamlit에서 실행 중인지 확인하고 secrets 가져오기
-try:
-    # Streamlit Cloud 환경에서는 st.secrets 사용
-    supabase_url = st.secrets["SUPABASE_URL"]
-    supabase_key = st.secrets["SUPABASE_KEY"]
-    openai_api_key = st.secrets["OPENAI_API_KEY"]
-except Exception as e:
-    # 로컬 환경에서는 환경 변수 사용
-    try:
-        import dotenv
-        dotenv.load_dotenv()
-        supabase_url = os.environ.get("SUPABASE_URL")
-        supabase_key = os.environ.get("SUPABASE_KEY")
-        openai_api_key = os.environ.get("OPENAI_API_KEY")
-    except:
-        st.error("API 키를 가져오는 데 실패했습니다. 환경 변수나 Streamlit Secrets가 제대로 설정되었는지 확인하세요.")
-        st.stop()
-
-# API 키 확인
-if not supabase_url or not supabase_key or not openai_api_key:
-    st.error("필요한 API 키가 설정되지 않았습니다.")
-    st.stop()
+# 환경 변수 로드
+dotenv.load_dotenv()
 
 # Supabase 클라이언트 초기화
-try:
-    supabase = create_client(supabase_url, supabase_key)
-    st.sidebar.success("Supabase 연결 성공!")
-except Exception as e:
-    st.error(f"Supabase 연결 중 오류가 발생했습니다: {str(e)}")
-    st.stop()
+supabase_url = os.environ.get("SUPABASE_URL")
+supabase_key = os.environ.get("SUPABASE_KEY")
+supabase = create_client(supabase_url, supabase_key)
 
-# OpenAI 클라이언트 초기화
-try:
-    openai_client = OpenAI(api_key=openai_api_key)
-    st.sidebar.success("OpenAI 연결 성공!")
-except Exception as e:
-    st.error(f"OpenAI 연결 중 오류가 발생했습니다: {str(e)}")
-    st.stop()
+# Sentence Transformer 모델 초기화 (무료)
+@st.cache_resource
+def load_embedding_model():
+    """임베딩 모델 로드 (캐시 사용으로 성능 최적화)"""
+    return SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+
+embedding_model = load_embedding_model()
 
 def generate_embedding(text):
-    """텍스트에서 OpenAI 임베딩 생성"""
-    try:
-        response = openai_client.embeddings.create(
-            input=text,
-            model="text-embedding-3-small"
-        )
-        return response.data[0].embedding
-    except Exception as e:
-        st.error(f"임베딩 생성 중 오류 발생: {str(e)}")
-        raise
+    """텍스트에서 임베딩 생성 (무료 모델 사용)"""
+    if not text or text.strip() == "":
+        # 빈 텍스트인 경우 기본 임베딩 반환
+        return [0.0] * 384  # MiniLM 모델의 차원 수
+    
+    embedding = embedding_model.encode(text)
+    return embedding.tolist()
 
-def semantic_search(query_text, limit=10, match_threshold=0.5):
-    """시맨틱 검색 수행"""
-    try:
-        # 쿼리 텍스트에 대한 임베딩 생성
-        query_embedding = generate_embedding(query_text)
+def clean_html_tags(text):
+    """HTML 태그 제거"""
+    if not text:
+        return ""
+    return re.sub(r'<.*?>', '', text)
+
+def detect_naver_api_type(data):
+    """네이버 API 응답 타입 감지 (블로그, 쇼핑, 뉴스)"""
+    if not isinstance(data, dict) or 'items' not in data:
+        return "unknown"
+    
+    # 샘플 아이템 확인
+    if not data['items']:
+        return "unknown"
+    
+    sample_item = data['items'][0]
+    
+    # 타입 감지 로직
+    if 'bloggername' in sample_item:
+        return "블로그"
+    elif 'productType' in sample_item or 'maker' in sample_item or 'mallName' in sample_item:
+        return "쇼핑"
+    elif 'pubDate' in sample_item and ('articleId' in sample_item or 'originallink' in sample_item):
+        return "뉴스"
+    else:
+        return "unknown"
+
+def process_json_file(file_path, collection_name=None, source_type=None):
+    """JSON 파일 처리 및 Supabase에 저장"""
+    # JSON 파일 로드
+    with open(file_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    # 네이버 API 응답 구조 확인
+    if isinstance(data, dict) and 'items' in data:
+        # 네이버 API 응답 형식인 경우
+        items = data['items']
         
-        # RPC를 통한 벡터 검색 (Supabase에 match_documents RPC 함수가 있는 경우)
-        try:
-            response = supabase.rpc(
-                'match_documents', 
-                {
-                    'query_embedding': query_embedding,
-                    'match_threshold': match_threshold,
-                    'match_count': limit
-                }
-            ).execute()
+        # 소스 타입이 지정되지 않은 경우 자동 감지
+        if not source_type:
+            source_type = detect_naver_api_type(data)
+            st.info(f"데이터 형식이 '{source_type}'으로 감지되었습니다.")
+    else:
+        # 직접 JSON 배열인 경우
+        items = data
+    
+    # 컬렉션 이름 생성
+    if not collection_name:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        collection_name = f'{source_type}_{timestamp}'
+    
+    # 처리된 문서 수 카운트
+    doc_count = 0
+    
+    # 각 항목 처리
+    for i, item in enumerate(items):
+        # 소스 타입별로 다른 필드 처리
+        if source_type == "블로그":
+            title = clean_html_tags(item.get('title', ''))
+            content = clean_html_tags(item.get('description', ''))
+            full_content = title + " " + content
             
-            if response.data and len(response.data) > 0:
-                st.sidebar.success("RPC 검색 성공!")
-                return response.data
-        except Exception as e:
-            st.sidebar.warning(f"RPC 검색 실패, 대체 방법으로 검색합니다: {str(e)}")
+            metadata = {
+                "title": title,
+                "collection": source_type,
+                "collected_at": datetime.now().isoformat(),
+                "url": item.get('link', ''),
+                "date": item.get('postdate', ''),
+                "bloggername": item.get('bloggername', ''),
+                "bloggerlink": item.get('bloggerlink', '')
+            }
+            
+        elif source_type == "쇼핑":
+            title = clean_html_tags(item.get('title', ''))
+            content = clean_html_tags(item.get('description', item.get('category3', '')))
+            full_content = title + " " + content
+            
+            # 가격 정보 숫자로 변환
+            price = item.get('lprice', '')
+            try:
+                price = int(price)
+            except (ValueError, TypeError):
+                price = None
+                
+            metadata = {
+                "title": title,
+                "collection": source_type,
+                "collected_at": datetime.now().isoformat(),
+                "url": item.get('link', ''),
+                "price": price,
+                "maker": item.get('maker', ''),
+                "brand": item.get('brand', ''),
+                "mallName": item.get('mallName', ''),
+                "productId": item.get('productId', ''),
+                "productType": item.get('productType', '')
+            }
+            
+        elif source_type == "뉴스":
+            title = clean_html_tags(item.get('title', ''))
+            content = clean_html_tags(item.get('description', ''))
+            full_content = title + " " + content
+            
+            metadata = {
+                "title": title,
+                "collection": source_type,
+                "collected_at": datetime.now().isoformat(),
+                "url": item.get('link', item.get('originallink', '')),
+                "date": item.get('pubDate', ''),
+                "publisher": item.get('publisher', '')
+            }
+            
+        else:
+            # 기본 처리 (타입이 불분명한 경우)
+            title = clean_html_tags(item.get('title', ''))
+            content = clean_html_tags(item.get('description', item.get('content', '')))
+            full_content = title + " " + content
+            
+            metadata = {
+                "title": title,
+                "collection": source_type if source_type else "general",
+                "collected_at": datetime.now().isoformat()
+            }
+            
+            # 공통 필드 추가
+            if 'link' in item:
+                metadata['url'] = item['link']
+            
+        # 임베딩 생성 (무료 모델 사용)
+        embedding = generate_embedding(full_content)
         
-        # 백업 방법: 모든 문서를 가져와서 클라이언트 측에서 유사도 계산
-        st.sidebar.info("데이터베이스에서 문서를 가져오는 중...")
-        result = supabase.table('documents').select('id, content, metadata, embedding').execute()
+        # Supabase에 데이터 삽입
+        data = {
+            'content': full_content,
+            'embedding': embedding,
+            'metadata': metadata
+        }
         
-        st.sidebar.info(f"총 {len(result.data)}개의 문서에서 유사도 계산 중...")
-        results = []
-        for item in result.data:
-            if 'embedding' in item and item['embedding'] is not None:
-                # 코사인 유사도 계산
-                item_embedding = item['embedding']
-                similarity = np.dot(query_embedding, item_embedding) / (
-                    np.linalg.norm(query_embedding) * np.linalg.norm(item_embedding)
+        supabase.table('documents').insert(data).execute()
+        doc_count += 1
+    
+    return collection_name, doc_count, source_type
+
+# Streamlit 앱 UI
+st.title("네이버 JSON 파일을 Supabase에 저장하기")
+
+# 모델 정보 표시
+st.sidebar.info("🆓 무료 임베딩 모델 사용 중: paraphrase-multilingual-MiniLM-L12-v2")
+
+uploaded_file = st.file_uploader("JSON 파일 업로드", type=['json'])
+
+if uploaded_file is not None:
+    # 파일 저장
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.json') as tmp_file:
+        tmp_file.write(uploaded_file.getvalue())
+        tmp_file_path = tmp_file.name
+    
+    # 타입 선택
+    source_type = st.radio(
+        "데이터 소스 타입 선택 (자동 감지하려면 '자동 감지' 선택)",
+        ['자동 감지', '블로그', '쇼핑', '뉴스']
+    )
+    
+    # 자동 감지인 경우 None으로 설정
+    if source_type == '자동 감지':
+        source_type = None
+    
+    # 컬렉션 이름 입력
+    collection_name = st.text_input("컬렉션 이름 (입력하지 않으면 자동 생성됩니다)")
+    
+    if st.button("Supabase에 저장"):
+        with st.spinner("데이터 처리 중..."):
+            try:
+                collection_name, doc_count, detected_type = process_json_file(
+                    tmp_file_path, 
+                    collection_name, 
+                    source_type
                 )
                 
-                if similarity > match_threshold:
-                    results.append({
-                        'id': item['id'],
-                        'content': item['content'],
-                        'metadata': item['metadata'],
-                        'similarity': float(similarity)
-                    })
-        
-        # 유사도 기준으로 정렬하고 상위 결과 반환
-        results = sorted(results, key=lambda x: x['similarity'], reverse=True)[:limit]
-        return results
-        
-    except Exception as e:
-        st.error(f"시맨틱 검색 중 오류 발생: {str(e)}")
-        raise
-
-# 메인 UI
-st.title("안성탕면 블로그 시맨틱 검색")
-st.write("Supabase 벡터 데이터베이스에 저장된 안성탕면 관련 블로그 데이터를 시맨틱 검색합니다.")
-
-# 검색 설정 UI
-st.sidebar.title("검색 설정")
-
-# 검색 입력
-query = st.text_input("검색어 입력", value="안성탕면", help="검색할 키워드나 문장을 입력하세요")
-
-col1, col2 = st.columns(2)
-with col1:
-    limit = st.slider("검색 결과 수", min_value=1, max_value=50, value=10)
-with col2:
-    threshold = st.slider("유사도 임계값", min_value=0.0, max_value=1.0, value=0.5, step=0.01)
-
-# 검색 버튼
-if st.button("검색", key="search_button"):
-    if query:
-        with st.spinner("검색 중..."):
-            try:
-                results = semantic_search(query, limit=limit, match_threshold=threshold)
+                st.success(f"성공적으로 {doc_count}개의 문서가 저장되었습니다!")
+                st.write(f"컬렉션 이름: {collection_name}")
+                st.write(f"데이터 타입: {detected_type}")
                 
-                if results:
-                    st.success(f"{len(results)}개의 결과를 찾았습니다.")
-                    
-                    # 결과 표시
-                    for i, result in enumerate(results):
-                        similarity = result['similarity'] * 100  # 백분율로 변환
-                        
-                        # 메타데이터에서 정보 추출
-                        metadata = result.get('metadata', {})
-                        title = metadata.get('title', '제목 없음')
-                        
-                        # 블로그 URL 추출 (메타데이터 구조에 따라 다르게 처리)
-                        url = None
-                        if 'url' in metadata:
-                            url = metadata['url']
-                        
-                        # 결과 표시
-                        with st.expander(f"{i+1}. {title} (유사도: {similarity:.2f}%)"):
-                            st.write(f"**내용:** {result['content'][:300]}...")
-                            
-                            # 메타데이터 정보 표시
-                            meta_col1, meta_col2 = st.columns(2)
-                            
-                            with meta_col1:
-                                if 'bloggername' in metadata:
-                                    st.write(f"**블로그:** {metadata['bloggername']}")
-                                if 'date' in metadata:
-                                    st.write(f"**날짜:** {metadata['date']}")
-                            
-                            with meta_col2:
-                                if url:
-                                    st.markdown(f"**링크:** [원본 글 보기]({url})")
-                                if 'collection' in metadata:
-                                    st.write(f"**컬렉션:** {metadata['collection']}")
-                else:
-                    st.warning("검색 결과가 없습니다. 다른 검색어를 시도해보세요.")
-            
+                # 데이터베이스 상태 표시
+                try:
+                    result = supabase.table('documents').select('id', count='exact').execute()
+                    doc_count_total = result.count if hasattr(result, 'count') else len(result.data)
+                    st.write(f"데이터베이스 총 문서 수: {doc_count_total}개")
+                except Exception as e:
+                    st.warning(f"데이터베이스 상태 확인 중 오류: {str(e)}")
+                
             except Exception as e:
-                st.error(f"검색 중 오류가 발생했습니다: {str(e)}")
-    else:
-        st.warning("검색어를 입력하세요.")
-
-# 데이터베이스 상태
-st.sidebar.title("데이터베이스 상태")
-try:
-    result = supabase.table('documents').select('id', count='exact').execute()
-    doc_count = result.count if hasattr(result, 'count') else len(result.data)
-    st.sidebar.info(f"저장된 문서 수: {doc_count}개")
-except Exception as e:
-    st.sidebar.error("데이터베이스 상태를 확인할 수 없습니다.")
-
-# 사용 안내
-st.sidebar.title("사용 안내")
-st.sidebar.info("""
-1. 검색어 입력: 검색하고 싶은 키워드나 문장을 입력하세요.
-2. 검색 결과 수: 보고 싶은 결과의 개수를 설정하세요.
-3. 유사도 임계값: 검색 결과의 최소 유사도를 설정하세요. 높을수록 더 관련성 높은 결과만 표시됩니다.
-""")
+                st.error(f"오류 발생: {str(e)}")
+            finally:
+                # 임시 파일 삭제
+                os.unlink(tmp_file_path)
