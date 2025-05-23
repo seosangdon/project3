@@ -6,7 +6,7 @@ from supabase import create_client
 from openai import OpenAI
 
 # 페이지 구성
-st.set_page_config(page_title="안성탕면 시맨틱 검색", layout="wide")
+st.set_page_config(page_title="모기 퇴치 시맨틱 검색", layout="wide")
 
 # Streamlit에서 실행 중인지 확인하고 secrets 가져오기
 try:
